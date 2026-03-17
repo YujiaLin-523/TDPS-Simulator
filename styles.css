@@ -107,6 +107,10 @@ canvas.dragging {
   cursor: grabbing;
 }
 
+canvas.draw-mode {
+  cursor: crosshair;
+}
+
 .side {
   display: grid;
   gap: 1rem;
@@ -119,6 +123,12 @@ canvas.dragging {
 .telemetry {
   padding: 0.9rem;
   min-width: 0;
+}
+
+.code-inline {
+  margin-top: 0.8rem;
+  padding: 0.8rem 0.4rem 0.2rem;
+  border-top: 1px solid var(--stroke);
 }
 
 .section-title {
@@ -244,6 +254,37 @@ textarea {
   word-break: break-word;
 }
 
+.api-doc {
+  margin-top: 0.55rem;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: #f7fafc;
+  padding: 0.35rem 0.5rem;
+}
+
+.api-doc summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: #2f485d;
+  font-weight: 600;
+}
+
+.api-doc pre {
+  margin: 0.45rem 0 0;
+  white-space: pre-wrap;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: #2b4257;
+}
+
+.memory-view {
+  max-height: 160px;
+  overflow: auto;
+  border-top: 1px dashed var(--stroke);
+  padding-top: 0.45rem;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -281,6 +322,37 @@ textarea {
   font-size: 0.84rem;
   min-width: 5ch;
   text-align: right;
+}
+
+.track-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  gap: 0.45rem 0.6rem;
+}
+
+.track-grid label,
+.mini-label {
+  font-size: 0.78rem;
+  color: #2f485d;
+}
+
+.track-grid input,
+.track-grid select {
+  width: 100%;
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 0.34rem 0.42rem;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78rem;
+  color: #1d2b38;
+  background: #fbfdff;
+}
+
+.small-textarea {
+  min-height: 88px;
+  margin-top: 0.35rem;
+  font-size: 0.78rem;
 }
 
 @media (max-width: 980px) {

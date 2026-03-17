@@ -50,6 +50,81 @@
         </div>
       </div>
       <canvas id="simCanvas" width="900" height="560"></canvas>
+
+      <section class="code code-inline">
+        <h2 class="section-title">Code Control</h2>
+        <textarea id="codeInput">// API demo: line follower using sensors + memory + logging.
+// Uses: api.getSensor, api.setWheelSpeeds, api.clamp, api.mem.*, api.log
+
+const left = api.getSensor("L")?.value || 0;
+const center = api.getSensor("C")?.value || 0;
+const right = api.getSensor("R")?.value || 0;
+
+const prevError = api.mem.get("prevError", 0);
+const lastTurn = api.mem.get("lastTurn", 1);
+const wasLost = api.mem.get("wasLost", false);
+
+const hasLine = Math.max(left, center, right) > 0.1;
+
+if (hasLine) {
+  const error = (right - left) + 0.25 * (right - center) - 0.25 * (left - center);
+  const dError = error - prevError;
+
+  const base = 0.32;
+  const kP = 1.55;
+  const kD = 0.65;
+  const turn = kP * error + kD * dError;
+
+  const leftCmd = api.clamp(base + turn, -1.2, 1.2);
+  const rightCmd = api.clamp(base - turn, -1.2, 1.2);
+  api.setWheelSpeeds(leftCmd, rightCmd, leftCmd, rightCmd);
+
+  api.mem.set("prevError", error);
+  api.mem.set("lastTurn", turn >= 0 ? 1 : -1);
+  api.mem.set("wasLost", false);
+} else {
+  // Reacquire behavior when all sensors miss the line.
+  const dir = lastTurn;
+  const pivot = 0.30;
+  api.setWheelSpeeds(dir * pivot, -dir * pivot, dir * pivot, -dir * pivot);
+
+  if (!wasLost) {
+    api.log("line lost -> pivot search", dir > 0 ? "left" : "right");
+    api.mem.set("wasLost", true);
+  }
+}</textarea>
+        <div class="button-row" style="margin-top: 0.6rem;">
+          <button id="enableCode" class="safe">Enable Code Mode</button>
+          <button id="runOnce" class="secondary">Run Once</button>
+          <button id="disableCode" class="warn">Disable Code Mode</button>
+          <button id="clearDebug" class="secondary">Clear Debug</button>
+        </div>
+        <div class="status" id="codeStatus">Code mode disabled.</div>
+        <details class="api-doc" open>
+          <summary>Full API List</summary>
+          <pre>api.time
+api.dt
+api.pose
+api.wheelSpeeds
+api.sensors
+api.getSensor(name)
+api.setWheelSpeed(name, value)
+api.setWheelSpeeds(vFL, vFR, vRL, vRR)
+api.clamp(value, min, max)
+api.log(...args)
+api.clearLog()
+api.mem.get(key, defaultValue)
+api.mem.set(key, value)
+api.mem.remove(key)
+api.mem.clear()
+api.mem.keys()</pre>
+        </details>
+        <details class="api-doc" open>
+          <summary>Script Memory Entries</summary>
+          <pre class="memory-view" id="memoryView">(empty)</pre>
+        </details>
+        <div class="debug-log" id="debugLog" aria-label="Code Debug Output"></div>
+      </section>
     </section>
 
     <aside class="side">
@@ -67,6 +142,37 @@
       <section class="panel telemetry">
         <h2 class="section-title">Telemetry</h2>
         <div class="metrics" id="metrics"></div>
+      </section>
+
+      <section class="panel controls">
+        <h2 class="section-title">Track & IR Sensors</h2>
+        <div class="track-grid">
+          <label for="cfgTrackPreset">track type</label>
+          <select id="cfgTrackPreset">
+            <option value="oval">Oval</option>
+            <option value="circle" selected>Circle</option>
+            <option value="figure8">Figure 8</option>
+            <option value="svg">SVG Path</option>
+          </select>
+
+          <label for="cfgLineWidth">line width (m)</label>
+          <input id="cfgLineWidth" type="number" min="0.005" max="0.2" step="0.005" value="0.03" />
+        </div>
+        <label class="mini-label" for="cfgSvgPath">svg path (meters, e.g. M -1 0 L 1 0)</label>
+        <textarea id="cfgSvgPath" class="small-textarea">M 0 0 L 1.2 0 L 1.2 0.8 L 0 0.8 Z</textarea>
+        <label class="mini-label" for="cfgSensors">sensor config (JSON array in car local coords, x=forward, y=left)</label>
+        <textarea id="cfgSensors" class="small-textarea">[
+  {"name":"L","x":0.16,"y":0.05},
+  {"name":"C","x":0.16,"y":0.00},
+  {"name":"R","x":0.16,"y":-0.05}
+]</textarea>
+        <div class="button-row" style="margin-top: 0.6rem;">
+          <button id="applyTrackSensors" class="safe">Apply Track/Sensors</button>
+          <button id="startTrackDraw" class="secondary">Start Draw</button>
+          <button id="finishTrackDraw" class="secondary">Finish Draw</button>
+          <button id="clearTrackDraw" class="warn">Clear Draw</button>
+        </div>
+        <div class="status" id="trackStatus">Track ready. Sensor API available as api.sensors and api.getSensor(name).</div>
       </section>
 
       <section class="panel controls">
@@ -90,25 +196,6 @@
         </div>
       </section>
 
-      <section class="panel code">
-        <h2 class="section-title">Code Control</h2>
-        <textarea id="codeInput">// This code runs every frame while code mode is enabled.
-// API: api.time, api.dt, api.pose, api.wheelSpeeds
-// API: api.setWheelSpeeds(vFL, vFR, vRL, vRR)
-// API: api.setWheelSpeed(name, value)  // name in FL, FR, RL, RR
-
-const base = 1.2;
-const turn = 0.8 * Math.sin(api.time * 0.8);
-api.setWheelSpeeds(base - turn, base + turn, base - turn, base + turn);</textarea>
-        <div class="button-row" style="margin-top: 0.6rem;">
-          <button id="enableCode" class="safe">Enable Code Mode</button>
-          <button id="runOnce" class="secondary">Run Once</button>
-          <button id="disableCode" class="warn">Disable Code Mode</button>
-          <button id="clearDebug" class="secondary">Clear Debug</button>
-        </div>
-        <div class="status" id="codeStatus">Code mode disabled.</div>
-        <div class="debug-log" id="debugLog" aria-label="Code Debug Output"></div>
-      </section>
     </aside>
   </main>
 

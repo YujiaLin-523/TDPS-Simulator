@@ -4,6 +4,7 @@ const wheelGrid = document.getElementById("wheelGrid");
 const metrics = document.getElementById("metrics");
 const codeInput = document.getElementById("codeInput");
 const codeStatus = document.getElementById("codeStatus");
+const memoryView = document.getElementById("memoryView");
 const debugLog = document.getElementById("debugLog");
 const clearDebug = document.getElementById("clearDebug");
 const camOffsetX = document.getElementById("camOffsetX");
@@ -20,10 +21,27 @@ const cfgMaxWheelSpeed = document.getElementById("cfgMaxWheelSpeed");
 const cfgWheelVisualScale = document.getElementById("cfgWheelVisualScale");
 const cfgTrailPoints = document.getElementById("cfgTrailPoints");
 const cfgMaxDt = document.getElementById("cfgMaxDt");
+const cfgTrackPreset = document.getElementById("cfgTrackPreset");
+const cfgLineWidth = document.getElementById("cfgLineWidth");
+const cfgSvgPath = document.getElementById("cfgSvgPath");
+const cfgSensors = document.getElementById("cfgSensors");
+const applyTrackSensors = document.getElementById("applyTrackSensors");
+const startTrackDraw = document.getElementById("startTrackDraw");
+const finishTrackDraw = document.getElementById("finishTrackDraw");
+const clearTrackDraw = document.getElementById("clearTrackDraw");
+const trackStatus = document.getElementById("trackStatus");
 
 const wheelNames = ["FL", "FR", "RL", "RR"];
 const wheelValueEls = {};
 let codeEditor = null;
+
+const TRACK_MASK_SIZE = 2400;
+const TRACK_PX_PER_M = 280;
+const trackMask = document.createElement("canvas");
+trackMask.width = TRACK_MASK_SIZE;
+trackMask.height = TRACK_MASK_SIZE;
+const trackMaskCtx = trackMask.getContext("2d", { willReadFrequently: true });
+
 const dragState = {
   active: false,
   lastX: 0,
@@ -52,8 +70,19 @@ const sim = {
     scale: 220,
     followCar: false,
   },
+  track: {
+    preset: "circle",
+    lineWidth: 0.03,
+    svgPath: cfgSvgPath.value,
+    sensors: [],
+    sensorReadings: [],
+    svgPath2D: null,
+    drawMode: false,
+    draftPoints: [],
+  },
   debugLines: [],
   maxDebugLines: 180,
+  scriptMemory: {},
 };
 
 function clamp(value, min, max) {
@@ -88,6 +117,47 @@ function updateWheelValue(name) {
   if (valueEl) {
     valueEl.textContent = `${n(sim.wheelSpeeds[name], 2)} m/s`;
   }
+}
+
+function setTrackStatus(message, isError = false) {
+  trackStatus.textContent = message;
+  trackStatus.style.color = isError ? "#9e352f" : "#27465f";
+}
+
+function bodyToWorld(localX, localY, pose) {
+  const c = Math.cos(pose.theta);
+  const s = Math.sin(pose.theta);
+  return {
+    x: pose.x + localX * c - localY * s,
+    y: pose.y + localX * s + localY * c,
+  };
+}
+
+function parseSensorConfig(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("Sensor JSON is invalid.");
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("Sensor config must be a non-empty JSON array.");
+  }
+
+  const sensors = parsed.map((item, index) => {
+    if (!item || typeof item !== "object") {
+      throw new Error(`Sensor ${index} must be an object.`);
+    }
+    const name = typeof item.name === "string" && item.name.trim() ? item.name.trim() : `S${index}`;
+    const x = Number(item.x);
+    const y = Number(item.y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      throw new Error(`Sensor ${name} must contain numeric x and y.`);
+    }
+    return { name, x, y };
+  });
+
+  return sensors;
 }
 
 function buildWheelGrid() {
@@ -125,6 +195,9 @@ function updateMetrics() {
   const p = sim.pose;
   const k = sim.lastKinematics || { vx: 0, omega: 0, radius: Infinity };
   const d = sim.lastDiagnostics || { motionState: "STATIONARY", lateralSlipIndicator: 0 };
+  const sensorSummary = sim.track.sensorReadings
+    .map((s) => `${s.name}:${n(s.value, 2)}`)
+    .join(" ");
 
   const values = [
     ["x", `${n(p.x, 2)} m`],
@@ -134,7 +207,7 @@ function updateMetrics() {
     ["omega", `${n(k.omega, 2)} rad/s`],
     ["radius", Number.isFinite(k.radius) ? `${n(k.radius, 2)} m` : "inf"],
     ["motion", d.motionState],
-    ["slip", `${n(d.lateralSlipIndicator, 3)}`],
+    ["sensors", sensorSummary || "n/a"],
   ];
 
   metrics.innerHTML = "";
@@ -157,11 +230,17 @@ function compileController() {
 function executeController(dt) {
   if (!sim.controller) return;
 
+  const sensors = sim.track.sensorReadings.map((sensor) => ({ ...sensor }));
+  const sensorMap = new Map(sensors.map((sensor) => [sensor.name, sensor]));
+
   const api = {
     dt,
     time: sim.time,
     pose: { ...sim.pose },
     wheelSpeeds: { ...sim.wheelSpeeds },
+    sensors,
+    getSensor: (name) => sensorMap.get(name),
+    mem: createScriptMemoryApi(),
     setWheelSpeed,
     setWheelSpeeds,
     log: (...parts) => addDebugLine(...parts),
@@ -206,7 +285,160 @@ function clearDebugLog() {
   renderDebugLog();
 }
 
+function renderMemoryView() {
+  const keys = Object.keys(sim.scriptMemory);
+  if (keys.length === 0) {
+    memoryView.textContent = "(empty)";
+    return;
+  }
+
+  const lines = keys.map((key) => {
+    let valueText;
+    try {
+      valueText = JSON.stringify(sim.scriptMemory[key]);
+    } catch {
+      valueText = String(sim.scriptMemory[key]);
+    }
+    return `${key}: ${valueText}`;
+  });
+  memoryView.textContent = lines.join("\n");
+}
+
+function cloneForMemory(value) {
+  if (typeof structuredClone === "function") {
+    return structuredClone(value);
+  }
+  if (value === undefined) return undefined;
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
+function createScriptMemoryApi() {
+  return {
+    get(key, defaultValue = undefined) {
+      if (Object.prototype.hasOwnProperty.call(sim.scriptMemory, key)) {
+        return cloneForMemory(sim.scriptMemory[key]);
+      }
+      return cloneForMemory(defaultValue);
+    },
+    set(key, value) {
+      sim.scriptMemory[key] = cloneForMemory(value);
+      renderMemoryView();
+      return cloneForMemory(sim.scriptMemory[key]);
+    },
+    remove(key) {
+      delete sim.scriptMemory[key];
+      renderMemoryView();
+    },
+    clear() {
+      sim.scriptMemory = {};
+      renderMemoryView();
+    },
+    keys() {
+      return Object.keys(sim.scriptMemory);
+    },
+  };
+}
+
+function drawPresetTrackPath(targetCtx, preset) {
+  if (preset === "circle") {
+    const r = 1.15;
+    // Circle centered at (r, 0) so the loop goes through (0, 0).
+    targetCtx.moveTo(0, 0);
+    targetCtx.arc(r, 0, r, Math.PI, Math.PI + 2 * Math.PI);
+    return;
+  }
+  if (preset === "figure8") {
+    const r = 0.7;
+    targetCtx.arc(-r, 0, r, 0, 2 * Math.PI);
+    targetCtx.moveTo(0, 0);
+    targetCtx.arc(r, 0, r, 0, 2 * Math.PI);
+    return;
+  }
+
+  // oval
+  targetCtx.ellipse(0, 0, 1.45, 0.9, 0, 0, 2 * Math.PI);
+}
+
+function drawTrackGeometry(targetCtx) {
+  targetCtx.beginPath();
+  if (sim.track.preset === "svg" && sim.track.svgPath2D) {
+    targetCtx.stroke(sim.track.svgPath2D);
+    return;
+  }
+  drawPresetTrackPath(targetCtx, sim.track.preset);
+  targetCtx.stroke();
+}
+
+function rebuildTrackMask() {
+  trackMaskCtx.save();
+  trackMaskCtx.fillStyle = "black";
+  trackMaskCtx.fillRect(0, 0, trackMask.width, trackMask.height);
+  trackMaskCtx.translate(trackMask.width / 2, trackMask.height / 2);
+  trackMaskCtx.scale(TRACK_PX_PER_M, -TRACK_PX_PER_M);
+  trackMaskCtx.lineCap = "round";
+  trackMaskCtx.lineJoin = "round";
+  trackMaskCtx.strokeStyle = "white";
+  trackMaskCtx.lineWidth = sim.track.lineWidth;
+  drawTrackGeometry(trackMaskCtx);
+  trackMaskCtx.restore();
+}
+
+function updateSensorReadings() {
+  sim.track.sensorReadings = sim.track.sensors.map((sensor) => {
+    const world = bodyToWorld(sensor.x, sensor.y, sim.pose);
+    const px = Math.round(trackMask.width / 2 + world.x * TRACK_PX_PER_M);
+    const py = Math.round(trackMask.height / 2 - world.y * TRACK_PX_PER_M);
+
+    let value = 0;
+    if (px >= 0 && px < trackMask.width && py >= 0 && py < trackMask.height) {
+      const rgba = trackMaskCtx.getImageData(px, py, 1, 1).data;
+      value = rgba[0] / 255;
+    }
+
+    return {
+      name: sensor.name,
+      x: sensor.x,
+      y: sensor.y,
+      worldX: world.x,
+      worldY: world.y,
+      value,
+    };
+  });
+}
+
+function applyTrackAndSensorConfig() {
+  try {
+    sim.track.preset = cfgTrackPreset.value;
+    sim.track.lineWidth = readNumberInput(cfgLineWidth, 0.005, 0.2, sim.track.lineWidth);
+    sim.track.svgPath = cfgSvgPath.value.trim();
+    sim.track.sensors = parseSensorConfig(cfgSensors.value);
+
+    sim.track.svgPath2D = null;
+    if (sim.track.preset === "svg") {
+      if (!sim.track.svgPath) {
+        throw new Error("SVG path is empty.");
+      }
+      sim.track.svgPath2D = new Path2D(sim.track.svgPath);
+    }
+
+    cfgLineWidth.value = String(sim.track.lineWidth);
+    rebuildTrackMask();
+    updateSensorReadings();
+    setTrackStatus(
+      `Track applied: ${sim.track.preset}, line width ${n(sim.track.lineWidth, 3)}m, sensors ${sim.track.sensors.length}.`
+    );
+  } catch (err) {
+    setTrackStatus(`Track/sensor config error: ${err.message}`, true);
+  }
+}
+
 function stepSimulation(dt) {
+  updateSensorReadings();
+
   if (sim.codeMode) {
     try {
       executeController(dt);
@@ -266,7 +498,6 @@ function drawGrid(scale, cx, cy) {
     ctx.stroke();
   }
 
-  // Draw world axes slightly stronger for orientation.
   ctx.strokeStyle = "rgba(230, 103, 46, 0.28)";
   ctx.lineWidth = 1.4;
   if (cx >= 0 && cx <= canvas.width) {
@@ -291,6 +522,13 @@ function worldToScreen(x, y, camCenterX, camCenterY, scale) {
   };
 }
 
+function screenToWorld(screenX, screenY, camCenterX, camCenterY, cameraWorldX, cameraWorldY, scale) {
+  return {
+    x: (screenX - camCenterX) / scale + cameraWorldX,
+    y: -(screenY - camCenterY) / scale + cameraWorldY,
+  };
+}
+
 function updateCameraLabels() {
   camOffsetXVal.textContent = `${sim.camera.offsetX}`;
   camOffsetYVal.textContent = `${sim.camera.offsetY}`;
@@ -308,8 +546,8 @@ function syncSimConfigInputs() {
 }
 
 function applySimConfigFromInputs() {
-  sim.trackWidth = readNumberInput(cfgTrackWidth, 0.2, 5, sim.trackWidth);
-  sim.wheelBase = readNumberInput(cfgWheelBase, 0.2, 8, sim.wheelBase);
+  sim.trackWidth = readNumberInput(cfgTrackWidth, 0.1, 5, sim.trackWidth);
+  sim.wheelBase = readNumberInput(cfgWheelBase, 0.1, 8, sim.wheelBase);
   sim.maxAbsWheelSpeed = readNumberInput(cfgMaxWheelSpeed, 0.2, 20, sim.maxAbsWheelSpeed);
   sim.wheelVisualScale = readNumberInput(cfgWheelVisualScale, 0.2, 3, sim.wheelVisualScale);
   sim.maxTrailPoints = Math.round(readNumberInput(cfgTrailPoints, 50, 20000, sim.maxTrailPoints));
@@ -333,17 +571,96 @@ function syncCameraInputs() {
   camZoom.value = String(sim.camera.scale);
 }
 
-function drawCar() {
-  const scale = sim.camera.scale;
-  const camCenterX = canvas.width / 2 + sim.camera.offsetX;
-  const camCenterY = canvas.height / 2 + sim.camera.offsetY;
-  const cameraWorldX = sim.camera.followCar ? sim.pose.x : 0;
-  const cameraWorldY = sim.camera.followCar ? sim.pose.y : 0;
-  const viewCenter = worldToScreen(-cameraWorldX, -cameraWorldY, camCenterX, camCenterY, scale);
+function drawTrack(camCenterX, camCenterY, cameraWorldX, cameraWorldY, scale) {
+  ctx.save();
+  ctx.translate(camCenterX, camCenterY);
+  ctx.scale(scale, -scale);
+  ctx.translate(-cameraWorldX, -cameraWorldY);
+  ctx.strokeStyle = "#222831";
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.globalAlpha = 0.9;
+  ctx.lineWidth = sim.track.lineWidth;
+  drawTrackGeometry(ctx);
+  ctx.restore();
 
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-  drawGrid(scale, viewCenter.x, viewCenter.y);
+  if (sim.track.draftPoints.length > 0) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(31, 136, 82, 0.95)";
+    ctx.fillStyle = "rgba(31, 136, 82, 0.95)";
+    ctx.lineWidth = 2;
 
+    ctx.beginPath();
+    for (let i = 0; i < sim.track.draftPoints.length; i += 1) {
+      const p = sim.track.draftPoints[i];
+      const s = worldToScreen(
+        p.x - cameraWorldX,
+        p.y - cameraWorldY,
+        camCenterX,
+        camCenterY,
+        scale
+      );
+      if (i === 0) {
+        ctx.moveTo(s.x, s.y);
+      } else {
+        ctx.lineTo(s.x, s.y);
+      }
+    }
+    ctx.stroke();
+
+    for (const p of sim.track.draftPoints) {
+      const s = worldToScreen(
+        p.x - cameraWorldX,
+        p.y - cameraWorldY,
+        camCenterX,
+        camCenterY,
+        scale
+      );
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, 3.5, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+}
+
+function draftPointsToSvgPath(points) {
+  if (points.length < 2) return "";
+  const parts = [`M ${points[0].x.toFixed(3)} ${points[0].y.toFixed(3)}`];
+  for (let i = 1; i < points.length; i += 1) {
+    parts.push(`L ${points[i].x.toFixed(3)} ${points[i].y.toFixed(3)}`);
+  }
+  return parts.join(" ");
+}
+
+function beginTrackDraw() {
+  sim.track.drawMode = true;
+  sim.track.draftPoints = [];
+  canvas.classList.add("draw-mode");
+  setTrackStatus("Draw mode enabled: click canvas to add points, then Finish Draw.");
+}
+
+function clearTrackDraft() {
+  sim.track.draftPoints = [];
+  setTrackStatus("Draft points cleared.");
+}
+
+function finishTrackDrawMode() {
+  if (sim.track.draftPoints.length < 2) {
+    setTrackStatus("Need at least 2 points to build a track path.", true);
+    return;
+  }
+
+  const svgPath = draftPointsToSvgPath(sim.track.draftPoints);
+  cfgSvgPath.value = svgPath;
+  cfgTrackPreset.value = "svg";
+  sim.track.drawMode = false;
+  canvas.classList.remove("draw-mode");
+  applyTrackAndSensorConfig();
+  setTrackStatus(`Draw complete with ${sim.track.draftPoints.length} points. SVG path applied.`);
+}
+
+function drawCar(camCenterX, camCenterY, cameraWorldX, cameraWorldY, scale) {
   if (sim.trail.length > 1) {
     ctx.save();
     ctx.strokeStyle = "rgba(230, 103, 46, 0.5)";
@@ -398,7 +715,6 @@ function drawCar() {
   ctx.closePath();
   ctx.fill();
 
-  // Keep wheel geometry proportional to zoom so layout is stable at any scale.
   const wheelL = 0.14 * scale * sim.wheelVisualScale;
   const wheelW = 0.07 * scale * sim.wheelVisualScale;
   const xOffset = bodyLength / 2 - wheelL * 0.65;
@@ -410,7 +726,33 @@ function drawCar() {
   ctx.fillRect(xOffset - wheelL / 2, -yOffset, wheelL, wheelW);
   ctx.fillRect(xOffset - wheelL / 2, yOffset - wheelW, wheelL, wheelW);
 
+  // Draw IR sensor dots in local frame (x forward, y left).
+  for (const sensor of sim.track.sensorReadings) {
+    const sx = sensor.x * scale;
+    const sy = -sensor.y * scale;
+    const intensity = clamp(sensor.value, 0, 1);
+    const r = 4;
+    ctx.fillStyle = `rgba(${Math.round(220 - 170 * intensity)}, ${Math.round(80 + 120 * intensity)}, 52, 0.95)`;
+    ctx.beginPath();
+    ctx.arc(sx, sy, r, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+
   ctx.restore();
+}
+
+function renderScene() {
+  const scale = sim.camera.scale;
+  const camCenterX = canvas.width / 2 + sim.camera.offsetX;
+  const camCenterY = canvas.height / 2 + sim.camera.offsetY;
+  const cameraWorldX = sim.camera.followCar ? sim.pose.x : 0;
+  const cameraWorldY = sim.camera.followCar ? sim.pose.y : 0;
+  const viewCenter = worldToScreen(-cameraWorldX, -cameraWorldY, camCenterX, camCenterY, scale);
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawGrid(scale, viewCenter.x, viewCenter.y);
+  drawTrack(camCenterX, camCenterY, cameraWorldX, cameraWorldY, scale);
+  drawCar(camCenterX, camCenterY, cameraWorldX, cameraWorldY, scale);
 }
 
 camOffsetX.addEventListener("input", (event) => {
@@ -455,7 +797,26 @@ for (const configInput of [
   configInput.addEventListener("change", applySimConfigFromInputs);
 }
 
+applyTrackSensors.addEventListener("click", applyTrackAndSensorConfig);
+startTrackDraw.addEventListener("click", beginTrackDraw);
+finishTrackDraw.addEventListener("click", finishTrackDrawMode);
+clearTrackDraw.addEventListener("click", clearTrackDraft);
+
 canvas.addEventListener("mousedown", (event) => {
+  if (sim.track.drawMode) {
+    const rect = canvas.getBoundingClientRect();
+    const x = ((event.clientX - rect.left) / rect.width) * canvas.width;
+    const y = ((event.clientY - rect.top) / rect.height) * canvas.height;
+    const camCenterX = canvas.width / 2 + sim.camera.offsetX;
+    const camCenterY = canvas.height / 2 + sim.camera.offsetY;
+    const cameraWorldX = sim.camera.followCar ? sim.pose.x : 0;
+    const cameraWorldY = sim.camera.followCar ? sim.pose.y : 0;
+    const world = screenToWorld(x, y, camCenterX, camCenterY, cameraWorldX, cameraWorldY, sim.camera.scale);
+    sim.track.draftPoints.push(world);
+    setTrackStatus(`Added point ${sim.track.draftPoints.length}: (${n(world.x, 2)}, ${n(world.y, 2)})`);
+    return;
+  }
+
   dragState.active = true;
   dragState.lastX = event.clientX;
   dragState.lastY = event.clientY;
@@ -502,6 +863,7 @@ document.getElementById("resetPose").addEventListener("click", () => {
   sim.trail = [];
   sim.lastKinematics = null;
   sim.lastDiagnostics = null;
+  updateSensorReadings();
   updateMetrics();
 });
 
@@ -519,6 +881,7 @@ document.getElementById("enableCode").addEventListener("click", () => {
 document.getElementById("runOnce").addEventListener("click", () => {
   try {
     compileController();
+    updateSensorReadings();
     executeController(0.016);
     setStatus("Script executed once.");
   } catch (err) {
@@ -542,7 +905,7 @@ function loop(now) {
     sim.time += dt;
   }
 
-  drawCar();
+  renderScene();
   updateMetrics();
 
   requestAnimationFrame(loop);
@@ -567,5 +930,7 @@ updateMetrics();
 syncCameraInputs();
 updateCameraLabels();
 syncSimConfigInputs();
+renderMemoryView();
+applyTrackAndSensorConfig();
 addDebugLine("Debug ready. Use api.log(...) and api.clearLog().");
 requestAnimationFrame(loop);
