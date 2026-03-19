@@ -94,6 +94,7 @@ if (hasLine) {
   }
 }</textarea>
         <div class="button-row" style="margin-top: 0.6rem;">
+          <button id="loadLfV1Template" class="secondary">Load LF V1 Template</button>
           <button id="enableCode" class="safe">Enable Code Mode</button>
           <button id="runOnce" class="secondary">Run Once</button>
           <button id="disableCode" class="warn">Disable Code Mode</button>
@@ -104,12 +105,19 @@ if (hasLine) {
           <summary>Full API List</summary>
           <pre>api.time
 api.dt
+api.millis
+api.getMillis()
 api.pose
 api.wheelSpeeds
 api.sensors
 api.getSensor(name)
+api.getSensorRaw(nameOrIndex)
+api.getLineSensorRaw(index)
+api.getLineSensorRawArray()
 api.setWheelSpeed(name, value)
 api.setWheelSpeeds(vFL, vFR, vRL, vRR)
+api.commandToWheelSpeed(cmd)
+api.setMotorCommand(leftCmd, rightCmd)
 api.clamp(value, min, max)
 api.log(...args)
 api.clearLog()
@@ -162,9 +170,10 @@ api.mem.keys()</pre>
         <textarea id="cfgSvgPath" class="small-textarea">M 0 0 L 1.2 0 L 1.2 0.8 L 0 0.8 Z</textarea>
         <label class="mini-label" for="cfgSensors">sensor config (JSON array in car local coords, x=forward, y=left)</label>
         <textarea id="cfgSensors" class="small-textarea">[
-  {"name":"L","x":0.16,"y":0.05},
-  {"name":"C","x":0.16,"y":0.00},
-  {"name":"R","x":0.16,"y":-0.05}
+  {"name":"S0","x":0.16,"y":0.075},
+  {"name":"S1","x":0.16,"y":0.025},
+  {"name":"S2","x":0.16,"y":-0.025},
+  {"name":"S3","x":0.16,"y":-0.075}
 ]</textarea>
         <div class="button-row" style="margin-top: 0.6rem;">
           <button id="applyTrackSensors" class="safe">Apply Track/Sensors</button>
@@ -194,6 +203,27 @@ api.mem.keys()</pre>
           <button id="camFollowToggle" class="secondary">Follow Car: Off</button>
           <button id="camReset" class="warn">Reset Camera</button>
         </div>
+      </section>
+
+      <section class="panel controls">
+        <h2 class="section-title">Auto Test</h2>
+        <div class="track-grid">
+          <label for="autoTestDuration">duration (s)</label>
+          <input id="autoTestDuration" type="number" min="1" max="180" step="1" value="15" />
+
+          <label for="autoTestDt">step dt (s)</label>
+          <input id="autoTestDt" type="number" min="0.002" max="0.05" step="0.001" value="0.01" />
+
+          <label for="autoTestLineThreshold">line threshold</label>
+          <input id="autoTestLineThreshold" type="number" min="0.01" max="0.95" step="0.01" value="0.12" />
+        </div>
+        <div class="button-row" style="margin-top: 0.6rem;">
+          <button id="runAutoTest" class="safe">Run Suite</button>
+          <button id="stopAutoTest" class="warn">Stop</button>
+          <button id="copyAutoTestReport" class="secondary">Copy Report</button>
+        </div>
+        <div class="status" id="autoTestStatus">Auto test idle.</div>
+        <pre class="auto-test-report" id="autoTestReport">(no report)</pre>
       </section>
 
     </aside>

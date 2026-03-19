@@ -360,3 +360,24 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+.auto-test-report {
+  margin-top: 0.55rem;
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  background: #f4f8fb;
+  min-height: 120px;
+  max-height: 260px;
+  overflow: auto;
+  padding: 0.55rem 0.6rem;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: #2c3f52;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#autoTestStatus {
+  min-height: 50px;
+}

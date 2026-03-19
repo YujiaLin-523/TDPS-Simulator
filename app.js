@@ -7,6 +7,7 @@ const codeStatus = document.getElementById("codeStatus");
 const memoryView = document.getElementById("memoryView");
 const debugLog = document.getElementById("debugLog");
 const clearDebug = document.getElementById("clearDebug");
+const loadLfV1Template = document.getElementById("loadLfV1Template");
 const camOffsetX = document.getElementById("camOffsetX");
 const camOffsetY = document.getElementById("camOffsetY");
 const camZoom = document.getElementById("camZoom");
@@ -30,10 +31,327 @@ const startTrackDraw = document.getElementById("startTrackDraw");
 const finishTrackDraw = document.getElementById("finishTrackDraw");
 const clearTrackDraw = document.getElementById("clearTrackDraw");
 const trackStatus = document.getElementById("trackStatus");
+const autoTestDuration = document.getElementById("autoTestDuration");
+const autoTestDt = document.getElementById("autoTestDt");
+const autoTestLineThreshold = document.getElementById("autoTestLineThreshold");
+const runAutoTest = document.getElementById("runAutoTest");
+const stopAutoTest = document.getElementById("stopAutoTest");
+const copyAutoTestReport = document.getElementById("copyAutoTestReport");
+const autoTestStatus = document.getElementById("autoTestStatus");
+const autoTestReport = document.getElementById("autoTestReport");
 
 const wheelNames = ["FL", "FR", "RL", "RR"];
 const wheelValueEls = {};
 let codeEditor = null;
+
+const LF_V1_TEMPLATE = `// LF v1 compatibility template (ported from ../code/line_follow_v1).
+// Expects 4 line sensors in order S0..S3 (left -> right).
+
+const CFG = {
+  control_period_ms: 10,
+  auto_start_delay_ms: 1200,
+  calibration_duration_ms: 3000,
+  calibration_switch_interval_ms: 300,
+  calibration_spin_speed: 180,
+  sensor_filter_alpha: 0.35,
+  line_detect_min_sum: 700,
+  sensor_weights: [-1500, -500, 500, 1500],
+  kp: 0.42,
+  ki: 0.0,
+  kd: 1.65,
+  base_speed: 360,
+  max_correction: 300,
+  max_motor_cmd: 900,
+  motor_deadband: 120,
+  recover_turn_speed: 220,
+  recover_timeout_ms: 900,
+};
+
+const STATE = {
+  WAIT_START: 1,
+  CALIBRATING: 2,
+  RUNNING: 3,
+  RECOVERING: 4,
+  STOPPED: 5,
+  FAULT: 6,
+};
+
+function clampI(value, minV, maxV) {
+  return Math.min(maxV, Math.max(minV, value));
+}
+
+function createInitialCtx(nowMs) {
+  return {
+    state: STATE.WAIT_START,
+    boot_ms: nowMs,
+    last_step_ms: nowMs,
+    calib_start_ms: 0,
+    recover_start_ms: 0,
+    last_seen_dir: 1,
+    calibration_ok: false,
+    pid: {
+      integral: 0,
+      prev_error: 0,
+      initialized: false,
+    },
+    calib: {
+      min_raw: [65535, 65535, 65535, 65535],
+      max_raw: [0, 0, 0, 0],
+      calibrated: false,
+    },
+    filtered: [0, 0, 0, 0],
+    last_position: 0,
+    last_frame: null,
+    last_motor: { left: 0, right: 0 },
+  };
+}
+
+function resetCalibration(ctx) {
+  ctx.calib.min_raw = [65535, 65535, 65535, 65535];
+  ctx.calib.max_raw = [0, 0, 0, 0];
+  ctx.calib.calibrated = false;
+}
+
+function readRawSensors4() {
+  const raw = api.getLineSensorRawArray();
+  const out = [0, 0, 0, 0];
+  for (let i = 0; i < 4; i += 1) {
+    const value = raw[i];
+    out[i] = Number.isFinite(value) ? clampI(Math.round(value), 0, 4095) : 0;
+  }
+  return out;
+}
+
+function updateCalibration(ctx, raw) {
+  for (let i = 0; i < 4; i += 1) {
+    if (raw[i] < ctx.calib.min_raw[i]) ctx.calib.min_raw[i] = raw[i];
+    if (raw[i] > ctx.calib.max_raw[i]) ctx.calib.max_raw[i] = raw[i];
+  }
+}
+
+function finishCalibration(ctx) {
+  let ok = true;
+  for (let i = 0; i < 4; i += 1) {
+    if (ctx.calib.max_raw[i] <= ctx.calib.min_raw[i] + 20) {
+      ok = false;
+      break;
+    }
+  }
+  ctx.calib.calibrated = ok;
+  ctx.calibration_ok = ok;
+}
+
+function normalizeWithCalib(raw, minV, maxV) {
+  if (maxV <= minV + 4) {
+    return clampI(Math.round((raw * 1000) / 4095), 0, 1000);
+  }
+  return clampI(Math.round(((raw - minV) * 1000) / (maxV - minV)), 0, 1000);
+}
+
+function readSensorFrame(ctx) {
+  const raw = readRawSensors4();
+  const norm = [0, 0, 0, 0];
+  const filtered = [0, 0, 0, 0];
+  const filteredU16 = [0, 0, 0, 0];
+  let weightedSum = 0;
+  let signalSum = 0;
+
+  for (let i = 0; i < 4; i += 1) {
+    const n = normalizeWithCalib(raw[i], ctx.calib.min_raw[i], ctx.calib.max_raw[i]);
+    const f = CFG.sensor_filter_alpha * n + (1 - CFG.sensor_filter_alpha) * ctx.filtered[i];
+    const fu16 = clampI(Math.round(f), 0, 1000);
+
+    ctx.filtered[i] = f;
+    norm[i] = n;
+    filtered[i] = f;
+    filteredU16[i] = fu16;
+
+    signalSum += fu16;
+    weightedSum += CFG.sensor_weights[i] * fu16;
+  }
+
+  const lineDetected = signalSum >= CFG.line_detect_min_sum;
+  let position = ctx.last_position;
+  if (lineDetected && signalSum > 0) {
+    position = Math.round(weightedSum / signalSum);
+    ctx.last_position = position;
+  }
+
+  return {
+    raw,
+    norm,
+    filtered,
+    filtered_u16: filteredU16,
+    signal_sum: signalSum,
+    position,
+    line_detected: lineDetected,
+  };
+}
+
+function resetPid(ctx) {
+  ctx.pid.integral = 0;
+  ctx.pid.prev_error = 0;
+  ctx.pid.initialized = false;
+}
+
+function updatePid(error, dtS, ctx) {
+  if (!(dtS > 0)) return 0;
+
+  if (!ctx.pid.initialized) {
+    ctx.pid.prev_error = error;
+    ctx.pid.initialized = true;
+  }
+
+  ctx.pid.integral += error * dtS;
+  ctx.pid.integral = clampI(ctx.pid.integral, -5000, 5000);
+
+  const derivative = (error - ctx.pid.prev_error) / dtS;
+  const output = CFG.kp * error + CFG.ki * ctx.pid.integral + CFG.kd * derivative;
+  ctx.pid.prev_error = error;
+
+  return clampI(Math.round(output), -CFG.max_correction, CFG.max_correction);
+}
+
+function computeMotorCmd(correction) {
+  const left = clampI(CFG.base_speed - correction, -CFG.max_motor_cmd, CFG.max_motor_cmd);
+  const right = clampI(CFG.base_speed + correction, -CFG.max_motor_cmd, CFG.max_motor_cmd);
+  return { left, right };
+}
+
+function applyDeadband(cmd) {
+  if (cmd === 0) return 0;
+  if (cmd > 0 && cmd < CFG.motor_deadband) return CFG.motor_deadband;
+  if (cmd < 0 && cmd > -CFG.motor_deadband) return -CFG.motor_deadband;
+  return cmd;
+}
+
+function chassisSetCommand(ctx, leftCmd, rightCmd) {
+  let left = clampI(Math.round(leftCmd), -CFG.max_motor_cmd, CFG.max_motor_cmd);
+  let right = clampI(Math.round(rightCmd), -CFG.max_motor_cmd, CFG.max_motor_cmd);
+  left = applyDeadband(left);
+  right = applyDeadband(right);
+  api.setMotorCommand(left, right);
+  ctx.last_motor = { left, right };
+}
+
+function chassisStop(ctx) {
+  api.setMotorCommand(0, 0);
+  ctx.last_motor = { left: 0, right: 0 };
+}
+
+function runCalibrationMotion(ctx, nowMs) {
+  const elapsed = nowMs - ctx.calib_start_ms;
+  const slot = Math.floor(elapsed / CFG.calibration_switch_interval_ms);
+  const spin = CFG.calibration_spin_speed;
+  if ((slot & 1) === 0) {
+    chassisSetCommand(ctx, spin, -spin);
+  } else {
+    chassisSetCommand(ctx, -spin, spin);
+  }
+}
+
+let ctx = api.mem.get("lfv1.ctx", null);
+if (!ctx) {
+  const now = api.getMillis();
+  ctx = createInitialCtx(now);
+  api.log("LF_V1 init");
+}
+
+const nowMs = api.getMillis();
+if ((nowMs - ctx.last_step_ms) < CFG.control_period_ms) {
+  api.mem.set("lfv1.ctx", ctx);
+  return;
+}
+
+const dtS = Math.max(0.0001, (nowMs - ctx.last_step_ms) / 1000);
+ctx.last_step_ms = nowMs;
+
+switch (ctx.state) {
+  case STATE.WAIT_START: {
+    if ((nowMs - ctx.boot_ms) >= CFG.auto_start_delay_ms) {
+      resetCalibration(ctx);
+      ctx.calib_start_ms = nowMs;
+      ctx.state = STATE.CALIBRATING;
+      api.log("Calibration start");
+    }
+    break;
+  }
+
+  case STATE.CALIBRATING: {
+    runCalibrationMotion(ctx, nowMs);
+    const raw = readRawSensors4();
+    updateCalibration(ctx, raw);
+
+    if ((nowMs - ctx.calib_start_ms) >= CFG.calibration_duration_ms) {
+      chassisStop(ctx);
+      finishCalibration(ctx);
+      resetPid(ctx);
+      ctx.state = STATE.RUNNING;
+      api.log("Calibration end -> RUNNING", { calibration_ok: ctx.calibration_ok });
+    }
+    break;
+  }
+
+  case STATE.RUNNING: {
+    const frame = readSensorFrame(ctx);
+    ctx.last_frame = frame;
+
+    if (!frame.line_detected) {
+      ctx.recover_start_ms = nowMs;
+      ctx.state = STATE.RECOVERING;
+      api.log("Line lost -> RECOVERING");
+      break;
+    }
+
+    const error = -frame.position;
+    const correction = updatePid(error, dtS, ctx);
+    const cmd = computeMotorCmd(correction);
+
+    if (frame.position < 0) ctx.last_seen_dir = -1;
+    else if (frame.position > 0) ctx.last_seen_dir = 1;
+
+    chassisSetCommand(ctx, cmd.left, cmd.right);
+    break;
+  }
+
+  case STATE.RECOVERING: {
+    const turn = CFG.recover_turn_speed;
+    if (ctx.last_seen_dir < 0) {
+      chassisSetCommand(ctx, -turn, turn);
+    } else {
+      chassisSetCommand(ctx, turn, -turn);
+    }
+
+    const frame = readSensorFrame(ctx);
+    ctx.last_frame = frame;
+
+    if (frame.line_detected) {
+      resetPid(ctx);
+      ctx.state = STATE.RUNNING;
+      api.log("Line recovered -> RUNNING");
+      break;
+    }
+
+    if ((nowMs - ctx.recover_start_ms) > CFG.recover_timeout_ms) {
+      chassisStop(ctx);
+      ctx.state = STATE.STOPPED;
+      api.log("Recovery timeout -> STOPPED");
+    }
+    break;
+  }
+
+  case STATE.STOPPED:
+    chassisStop(ctx);
+    break;
+
+  default:
+    chassisStop(ctx);
+    ctx.state = STATE.FAULT;
+    break;
+}
+
+api.mem.set("lfv1.ctx", ctx);
+`;
 
 const TRACK_MASK_SIZE = 2400;
 const TRACK_PX_PER_M = 280;
@@ -83,6 +401,11 @@ const sim = {
   debugLines: [],
   maxDebugLines: 180,
   scriptMemory: {},
+  autoTest: {
+    running: false,
+    abortRequested: false,
+    lastReport: null,
+  },
 };
 
 function clamp(value, min, max) {
@@ -108,6 +431,22 @@ function setWheelSpeeds(vFL, vFR, vRL, vRR) {
   setWheelSpeed("RR", vRR);
 }
 
+function sensorValueToRaw(value) {
+  return Math.round(clamp(value, 0, 1) * 4095);
+}
+
+function commandToWheelSpeed(cmd) {
+  const numeric = Number(cmd);
+  const safeCmd = Number.isFinite(numeric) ? numeric : 0;
+  return (clamp(safeCmd, -1000, 1000) / 1000) * sim.maxAbsWheelSpeed;
+}
+
+function setMotorCommand(leftCmd, rightCmd) {
+  const leftSpeed = commandToWheelSpeed(leftCmd);
+  const rightSpeed = commandToWheelSpeed(rightCmd);
+  setWheelSpeeds(leftSpeed, rightSpeed, leftSpeed, rightSpeed);
+}
+
 function n(value, digits = 2) {
   return value.toFixed(digits);
 }
@@ -122,6 +461,45 @@ function updateWheelValue(name) {
 function setTrackStatus(message, isError = false) {
   trackStatus.textContent = message;
   trackStatus.style.color = isError ? "#9e352f" : "#27465f";
+}
+
+function setAutoTestStatus(message, isError = false) {
+  if (autoTestStatus == null) return;
+  autoTestStatus.textContent = message;
+  autoTestStatus.style.color = isError ? "#9e352f" : "#27465f";
+}
+
+function formatAutoTestReport(report) {
+  if (report == null) return "(no report)";
+
+  const summary = report.summary || {};
+  const lines = [
+    "Overall score: " + Number(summary.overallScore || 0).toFixed(1) + " / 100",
+    "Scenarios: " + (summary.scenarioCount || 0) + ", completed: " + (summary.completedCount || 0) + ", aborted: " + (summary.aborted ? "yes" : "no"),
+    "Avg line detection: " + Number((summary.avgLineDetectionRate || 0) * 100).toFixed(1) + "%",
+    "Max longest line loss: " + Number(summary.maxLongestLostSec || 0).toFixed(3) + " s",
+  ];
+
+  if (Array.isArray(report.issues) && report.issues.length > 0) {
+    lines.push("Issues:");
+    for (const issue of report.issues) {
+      lines.push("- " + issue);
+    }
+  }
+
+  lines.push("", "JSON:", JSON.stringify(report, null, 2));
+  return lines.join("\n");
+}
+
+function renderAutoTestReport(report) {
+  if (autoTestReport == null) return;
+  autoTestReport.textContent = formatAutoTestReport(report);
+}
+
+function syncAutoTestButtons() {
+  if (runAutoTest) runAutoTest.disabled = sim.autoTest.running;
+  if (stopAutoTest) stopAutoTest.disabled = sim.autoTest.running === false;
+  if (copyAutoTestReport) copyAutoTestReport.disabled = sim.autoTest.lastReport == null;
 }
 
 function bodyToWorld(localX, localY, pose) {
@@ -222,6 +600,21 @@ function updateMetrics() {
   }
 }
 
+function setCodeEditorValue(source) {
+  if (codeEditor) {
+    codeEditor.setValue(source);
+    return;
+  }
+  codeInput.value = source;
+}
+
+function loadLfV1TemplateIntoEditor(showStatus = true) {
+  setCodeEditorValue(LF_V1_TEMPLATE);
+  if (showStatus) {
+    setStatus("Loaded LF V1 compatibility template.");
+  }
+}
+
 function compileController() {
   const source = codeEditor ? codeEditor.getValue() : codeInput.value;
   sim.controller = new Function("api", source);
@@ -232,17 +625,37 @@ function executeController(dt) {
 
   const sensors = sim.track.sensorReadings.map((sensor) => ({ ...sensor }));
   const sensorMap = new Map(sensors.map((sensor) => [sensor.name, sensor]));
+  const sensorRaw = sensors.map((sensor) => sensorValueToRaw(sensor.value));
+  const millis = Math.round(sim.time * 1000);
 
   const api = {
     dt,
     time: sim.time,
+    millis,
+    getMillis: () => millis,
     pose: { ...sim.pose },
     wheelSpeeds: { ...sim.wheelSpeeds },
     sensors,
+    sensorRaw: sensorRaw.slice(),
     getSensor: (name) => sensorMap.get(name),
+    getSensorRaw: (nameOrIndex) => {
+      if (typeof nameOrIndex === "number" && Number.isInteger(nameOrIndex)) {
+        return sensorRaw[nameOrIndex];
+      }
+      const sensor = sensorMap.get(String(nameOrIndex));
+      return sensor ? sensorValueToRaw(sensor.value) : undefined;
+    },
+    getLineSensorRaw: (index) => {
+      const i = Number(index);
+      if (!Number.isInteger(i)) return undefined;
+      return sensorRaw[i];
+    },
+    getLineSensorRawArray: () => sensorRaw.slice(),
     mem: createScriptMemoryApi(),
     setWheelSpeed,
     setWheelSpeeds,
+    commandToWheelSpeed,
+    setMotorCommand,
     log: (...parts) => addDebugLine(...parts),
     clearLog: clearDebugLog,
     clamp,
@@ -343,6 +756,460 @@ function createScriptMemoryApi() {
   };
 }
 
+function captureAutoTestTrackInputs() {
+  return {
+    preset: cfgTrackPreset.value,
+    lineWidth: cfgLineWidth.value,
+    svgPath: cfgSvgPath.value,
+    sensors: cfgSensors.value,
+  };
+}
+
+function applyAutoTestTrackInputs(trackInputs) {
+  cfgTrackPreset.value = trackInputs.preset;
+  cfgLineWidth.value = trackInputs.lineWidth;
+  cfgSvgPath.value = trackInputs.svgPath;
+  cfgSensors.value = trackInputs.sensors;
+  return applyTrackAndSensorConfig();
+}
+
+function captureAutoTestSnapshot() {
+  return {
+    running: sim.running,
+    codeMode: sim.codeMode,
+    controller: sim.controller,
+    time: sim.time,
+    pose: { ...sim.pose },
+    wheelSpeeds: { ...sim.wheelSpeeds },
+    trail: sim.trail.map((p) => ({ ...p })),
+    lastKinematics: cloneForMemory(sim.lastKinematics),
+    lastDiagnostics: cloneForMemory(sim.lastDiagnostics),
+    scriptMemory: cloneForMemory(sim.scriptMemory),
+    debugLines: sim.debugLines.slice(),
+    trackInputs: captureAutoTestTrackInputs(),
+    codeStatus: {
+      text: codeStatus.textContent,
+      color: codeStatus.style.color,
+    },
+  };
+}
+
+function restoreAutoTestSnapshot(snapshot) {
+  applyAutoTestTrackInputs(snapshot.trackInputs);
+
+  sim.running = snapshot.running;
+  sim.codeMode = snapshot.codeMode;
+  sim.controller = snapshot.controller;
+  sim.time = snapshot.time;
+  sim.pose = { ...snapshot.pose };
+  sim.wheelSpeeds = { ...snapshot.wheelSpeeds };
+  for (const name of wheelNames) {
+    updateWheelValue(name);
+  }
+
+  sim.trail = snapshot.trail.map((p) => ({ ...p }));
+  sim.lastKinematics = cloneForMemory(snapshot.lastKinematics);
+  sim.lastDiagnostics = cloneForMemory(snapshot.lastDiagnostics);
+  sim.scriptMemory = cloneForMemory(snapshot.scriptMemory) || {};
+  sim.debugLines = snapshot.debugLines.slice(-sim.maxDebugLines);
+
+  codeStatus.textContent = snapshot.codeStatus.text;
+  codeStatus.style.color = snapshot.codeStatus.color;
+
+  renderMemoryView();
+  renderDebugLog();
+  updateSensorReadings();
+  updateMetrics();
+}
+
+function buildAutoTestScenarios(baseTrackInputs, basePose) {
+  const lineWidthValue = Number(baseTrackInputs.lineWidth);
+  const lineWidth = Number.isFinite(lineWidthValue) ? String(lineWidthValue) : "0.03";
+  const currentTrack = {
+    preset: baseTrackInputs.preset,
+    lineWidth,
+    svgPath: baseTrackInputs.svgPath,
+    sensors: baseTrackInputs.sensors,
+  };
+
+  const leftOffset = 0.04;
+  const offsetPose = {
+    x: basePose.x - Math.sin(basePose.theta) * leftOffset,
+    y: basePose.y + Math.cos(basePose.theta) * leftOffset,
+    theta: basePose.theta,
+  };
+
+  return [
+    {
+      id: "current_baseline",
+      name: `Current track (${currentTrack.preset}) baseline`,
+      trackInputs: currentTrack,
+      startPose: { ...basePose },
+    },
+    {
+      id: "current_left_offset",
+      name: `Current track (${currentTrack.preset}) left offset`,
+      trackInputs: currentTrack,
+      startPose: offsetPose,
+    },
+    {
+      id: "circle_reference",
+      name: "Circle reference",
+      trackInputs: {
+        preset: "circle",
+        lineWidth,
+        svgPath: currentTrack.svgPath,
+        sensors: currentTrack.sensors,
+      },
+      startPose: { x: 0, y: 0, theta: Math.PI / 2 },
+    },
+    {
+      id: "figure8_reference",
+      name: "Figure8 reference",
+      trackInputs: {
+        preset: "figure8",
+        lineWidth,
+        svgPath: currentTrack.svgPath,
+        sensors: currentTrack.sensors,
+      },
+      startPose: { x: 0, y: 0, theta: Math.PI / 2 },
+    },
+  ];
+}
+
+function resetAutoTestScenarioState(startPose) {
+  sim.time = 0;
+  sim.pose = { ...startPose };
+  sim.trail = [];
+  sim.lastKinematics = null;
+  sim.lastDiagnostics = null;
+  sim.scriptMemory = {};
+  setWheelSpeeds(0, 0, 0, 0);
+  renderMemoryView();
+  updateSensorReadings();
+}
+
+function estimateAutoTestLineState(sensorReadings, lineThreshold) {
+  let signalSum = 0;
+  let weightedY = 0;
+  let maxValue = 0;
+
+  for (const sensor of sensorReadings) {
+    const value = clamp(sensor.value, 0, 1);
+    signalSum += value;
+    weightedY += sensor.y * value;
+    if (value > maxValue) {
+      maxValue = value;
+    }
+  }
+
+  const lineDetected = maxValue >= lineThreshold;
+  const lineErrorM = signalSum > 1e-9 ? weightedY / signalSum : 0;
+  return { lineDetected, lineErrorM, confidence: maxValue };
+}
+
+function scoreAutoTestScenario(result) {
+  if (result.runtimeError == null) {
+    let score = 100;
+    score -= (1 - result.lineDetectionRate) * 60;
+    score -= Math.min(result.meanAbsErrorM / 0.08, 1) * 20;
+    score -= Math.min(result.longestLostSec / 2.0, 1) * 15;
+    score -= Math.min(result.motorSaturationRate / 0.6, 1) * 5;
+    return clamp(score, 0, 100);
+  }
+  return 0;
+}
+
+async function runAutoTestScenario(scenario, options, scenarioIndex, scenarioCount) {
+  const { durationSec, dt, lineThreshold } = options;
+  const targetSteps = Math.max(1, Math.round(durationSec / dt));
+
+  let steps = 0;
+  let lineDetectedSteps = 0;
+  let lineLostTransitions = 0;
+  let lineRecoveredTransitions = 0;
+  let longestLostSec = 0;
+  let currentLostSec = 0;
+  let totalLostSec = 0;
+  let absErrorAccum = 0;
+  let sqErrorAccum = 0;
+  let errorSamples = 0;
+  let maxAbsError = 0;
+  let motorSaturationSteps = 0;
+  let distanceM = 0;
+  let runtimeError = null;
+  let prevLineDetected = null;
+
+  for (let step = 0; step < targetSteps; step += 1) {
+    if (sim.autoTest.abortRequested) {
+      break;
+    }
+
+    let stepResult;
+    try {
+      stepResult = simulateStep(dt, { catchControllerError: false });
+    } catch (err) {
+      runtimeError = err && err.message ? err.message : String(err);
+      break;
+    }
+
+    sim.time += dt;
+    steps += 1;
+    distanceM += Math.hypot(stepResult.delta.dx, stepResult.delta.dy);
+
+    const lineState = estimateAutoTestLineState(sim.track.sensorReadings, lineThreshold);
+
+    if (lineState.lineDetected) {
+      lineDetectedSteps += 1;
+      absErrorAccum += Math.abs(lineState.lineErrorM);
+      sqErrorAccum += lineState.lineErrorM * lineState.lineErrorM;
+      maxAbsError = Math.max(maxAbsError, Math.abs(lineState.lineErrorM));
+      errorSamples += 1;
+      if (currentLostSec > 0) {
+        longestLostSec = Math.max(longestLostSec, currentLostSec);
+        currentLostSec = 0;
+      }
+    } else {
+      currentLostSec += dt;
+      totalLostSec += dt;
+      if (prevLineDetected === true) {
+        lineLostTransitions += 1;
+      }
+    }
+
+    if (prevLineDetected === false && lineState.lineDetected) {
+      lineRecoveredTransitions += 1;
+    }
+    prevLineDetected = lineState.lineDetected;
+
+    const saturated = wheelNames.some((name) => Math.abs(sim.wheelSpeeds[name]) >= sim.maxAbsWheelSpeed - 1e-6);
+    if (saturated) {
+      motorSaturationSteps += 1;
+    }
+
+    if ((step + 1) % 250 === 0 || step + 1 === targetSteps) {
+      const percent = Math.round(((step + 1) / targetSteps) * 100);
+      setAutoTestStatus(`Running ${scenarioIndex + 1}/${scenarioCount}: ${scenario.name} (${percent}%)`);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  if (currentLostSec > 0) {
+    longestLostSec = Math.max(longestLostSec, currentLostSec);
+  }
+
+  const lineDetectionRate = steps > 0 ? lineDetectedSteps / steps : 0;
+  const meanAbsErrorM = errorSamples > 0 ? absErrorAccum / errorSamples : 0;
+  const rmsErrorM = errorSamples > 0 ? Math.sqrt(sqErrorAccum / errorSamples) : 0;
+  const motorSaturationRate = steps > 0 ? motorSaturationSteps / steps : 0;
+
+  const result = {
+    id: scenario.id,
+    name: scenario.name,
+    preset: scenario.trackInputs.preset,
+    durationTargetSec: durationSec,
+    durationSimulatedSec: steps * dt,
+    steps,
+    lineDetectionRate,
+    lineLostTransitions,
+    lineRecoveredTransitions,
+    longestLostSec,
+    totalLostSec,
+    meanAbsErrorM,
+    rmsErrorM,
+    maxAbsErrorM: maxAbsError,
+    motorSaturationRate,
+    distanceM,
+    runtimeError,
+  };
+
+  result.score = scoreAutoTestScenario(result);
+  return result;
+}
+
+function buildAutoTestReport({
+  startedAt,
+  durationSec,
+  dt,
+  lineThreshold,
+  scenarios,
+  results,
+  aborted,
+  suiteError,
+}) {
+  const completed = results.filter((r) => (r.runtimeError == null)).length;
+  const avgLineDetectionRate =
+    results.length > 0 ? results.reduce((sum, r) => sum + r.lineDetectionRate, 0) / results.length : 0;
+  const overallScore =
+    results.length > 0 ? results.reduce((sum, r) => sum + r.score, 0) / results.length : 0;
+  const maxLongestLostSec =
+    results.length > 0 ? Math.max(...results.map((r) => r.longestLostSec || 0)) : 0;
+
+  const issues = [];
+  if (aborted) {
+    issues.push("Suite aborted manually.");
+  }
+  if (suiteError) {
+    issues.push(`Suite internal error: ${suiteError}`);
+  }
+
+  const runtimeFailures = results.filter((r) => (r.runtimeError == null ? false : true));
+  if (runtimeFailures.length > 0) {
+    issues.push(`Runtime errors in: ${runtimeFailures.map((r) => r.id).join(", ")}`);
+  }
+
+  if (avgLineDetectionRate < 0.85) {
+    issues.push("Average line detection is below 85%; check threshold, sensor layout, or recovery logic.");
+  }
+  if (maxLongestLostSec > 1.0) {
+    issues.push("Line loss duration exceeds 1s in at least one scenario.");
+  }
+
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    startedAt,
+    config: {
+      durationSec,
+      dt,
+      lineThreshold,
+      scenarioIds: scenarios.map((s) => s.id),
+    },
+    summary: {
+      scenarioCount: scenarios.length,
+      completedCount: completed,
+      aborted,
+      overallScore,
+      avgLineDetectionRate,
+      maxLongestLostSec,
+    },
+    issues,
+    scenarios: results,
+  };
+}
+
+async function runAutoTestSuite() {
+  if (sim.autoTest.running) {
+    return;
+  }
+
+  if (autoTestDuration == null || autoTestDt == null || autoTestLineThreshold == null) {
+    setAutoTestStatus("Auto test controls are not available.", true);
+    return;
+  }
+
+  const durationSec = readNumberInput(autoTestDuration, 1, 180, 15);
+  const dt = readNumberInput(autoTestDt, 0.002, 0.05, 0.01);
+  const lineThreshold = readNumberInput(autoTestLineThreshold, 0.01, 0.95, 0.12);
+
+  autoTestDuration.value = String(durationSec);
+  autoTestDt.value = String(dt);
+  autoTestLineThreshold.value = String(lineThreshold);
+
+  try {
+    compileController();
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    setAutoTestStatus(`Compile error: ${message}`, true);
+    setStatus(`Compile error: ${message}`, true);
+    return;
+  }
+
+  const snapshot = captureAutoTestSnapshot();
+  const startedAt = new Date().toISOString();
+  const baseTrackInputs = captureAutoTestTrackInputs();
+  const scenarios = buildAutoTestScenarios(baseTrackInputs, snapshot.pose);
+
+  sim.autoTest.running = true;
+  sim.autoTest.abortRequested = false;
+  sim.autoTest.lastReport = null;
+  sim.running = false;
+  sim.codeMode = true;
+
+  renderAutoTestReport(null);
+  syncAutoTestButtons();
+  clearDebugLog();
+  setAutoTestStatus(`Preparing ${scenarios.length} scenarios...`);
+
+  const results = [];
+  let suiteError = null;
+
+  try {
+    for (let i = 0; i < scenarios.length; i += 1) {
+      if (sim.autoTest.abortRequested) {
+        break;
+      }
+
+      const scenario = scenarios[i];
+      const trackApplied = applyAutoTestTrackInputs(scenario.trackInputs);
+      if (trackApplied === false) {
+        results.push({
+          id: scenario.id,
+          name: scenario.name,
+          preset: scenario.trackInputs.preset,
+          durationTargetSec: durationSec,
+          durationSimulatedSec: 0,
+          steps: 0,
+          lineDetectionRate: 0,
+          lineLostTransitions: 0,
+          lineRecoveredTransitions: 0,
+          longestLostSec: 0,
+          totalLostSec: 0,
+          meanAbsErrorM: 0,
+          rmsErrorM: 0,
+          maxAbsErrorM: 0,
+          motorSaturationRate: 0,
+          distanceM: 0,
+          runtimeError: "Track/sensor config apply failed",
+          score: 0,
+        });
+        continue;
+      }
+
+      resetAutoTestScenarioState(scenario.startPose);
+      const scenarioResult = await runAutoTestScenario(
+        scenario,
+        { durationSec, dt, lineThreshold },
+        i,
+        scenarios.length
+      );
+      results.push(scenarioResult);
+    }
+  } catch (err) {
+    suiteError = err && err.message ? err.message : String(err);
+  } finally {
+    restoreAutoTestSnapshot(snapshot);
+  }
+
+  const aborted = sim.autoTest.abortRequested ? true : false;
+  const report = buildAutoTestReport({
+    startedAt,
+    durationSec,
+    dt,
+    lineThreshold,
+    scenarios,
+    results,
+    aborted,
+    suiteError,
+  });
+
+  sim.autoTest.lastReport = report;
+  sim.autoTest.running = false;
+  sim.autoTest.abortRequested = false;
+  renderAutoTestReport(report);
+  syncAutoTestButtons();
+
+  if (suiteError) {
+    setAutoTestStatus(`Auto test failed: ${suiteError}`, true);
+  } else if (aborted) {
+    setAutoTestStatus("Auto test aborted by user.", true);
+  } else {
+    setAutoTestStatus(
+      `Auto test done. Score ${n(report.summary.overallScore, 1)}/100, avg detection ${(report.summary.avgLineDetectionRate * 100).toFixed(1)}%.`
+    );
+  }
+}
+
 function drawPresetTrackPath(targetCtx, preset) {
   if (preset === "circle") {
     const r = 1.15;
@@ -419,7 +1286,7 @@ function applyTrackAndSensorConfig() {
 
     sim.track.svgPath2D = null;
     if (sim.track.preset === "svg") {
-      if (!sim.track.svgPath) {
+      if (sim.track.svgPath === "") {
         throw new Error("SVG path is empty.");
       }
       sim.track.svgPath2D = new Path2D(sim.track.svgPath);
@@ -431,20 +1298,29 @@ function applyTrackAndSensorConfig() {
     setTrackStatus(
       `Track applied: ${sim.track.preset}, line width ${n(sim.track.lineWidth, 3)}m, sensors ${sim.track.sensors.length}.`
     );
+    return true;
   } catch (err) {
     setTrackStatus(`Track/sensor config error: ${err.message}`, true);
+    return false;
   }
 }
 
-function stepSimulation(dt) {
+function simulateStep(dt, options = {}) {
+  const { catchControllerError = true } = options;
+
   updateSensorReadings();
 
   if (sim.codeMode) {
-    try {
+    if (catchControllerError) {
+      try {
+        executeController(dt);
+      } catch (err) {
+        sim.codeMode = false;
+        setStatus(`Code error: ${err.message}`, true);
+        throw err;
+      }
+    } else {
       executeController(dt);
-    } catch (err) {
-      sim.codeMode = false;
-      setStatus(`Code error: ${err.message}`, true);
     }
   }
 
@@ -466,6 +1342,16 @@ function stepSimulation(dt) {
   sim.trail.push({ x: sim.pose.x, y: sim.pose.y });
   if (sim.trail.length > sim.maxTrailPoints) {
     sim.trail.shift();
+  }
+
+  return result;
+}
+
+function stepSimulation(dt) {
+  try {
+    simulateStep(dt, { catchControllerError: true });
+  } catch {
+    // Error already handled in simulateStep for realtime mode.
   }
 }
 
@@ -786,6 +1672,47 @@ camReset.addEventListener("click", () => {
 
 clearDebug.addEventListener("click", clearDebugLog);
 
+if (runAutoTest) {
+  runAutoTest.addEventListener("click", () => {
+    runAutoTestSuite();
+  });
+}
+
+if (stopAutoTest) {
+  stopAutoTest.addEventListener("click", () => {
+    if (sim.autoTest.running === false) return;
+    sim.autoTest.abortRequested = true;
+    setAutoTestStatus("Stop requested. Finishing current step...");
+  });
+}
+
+if (copyAutoTestReport) {
+  copyAutoTestReport.addEventListener("click", async () => {
+    if (sim.autoTest.lastReport == null) {
+      setAutoTestStatus("No report available to copy.", true);
+      return;
+    }
+
+    const text = JSON.stringify(sim.autoTest.lastReport, null, 2);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        setAutoTestStatus("Auto test report copied.");
+      } else {
+        throw new Error("Clipboard API unavailable");
+      }
+    } catch {
+      setAutoTestStatus("Copy failed. Please copy from the report panel manually.", true);
+    }
+  });
+}
+
+if (loadLfV1Template) {
+  loadLfV1Template.addEventListener("click", () => {
+    loadLfV1TemplateIntoEditor(true);
+  });
+}
+
 for (const configInput of [
   cfgTrackWidth,
   cfgWheelBase,
@@ -925,6 +1852,7 @@ function initializeCodeEditor() {
 }
 
 initializeCodeEditor();
+loadLfV1TemplateIntoEditor(false);
 buildWheelGrid();
 updateMetrics();
 syncCameraInputs();
@@ -932,5 +1860,7 @@ updateCameraLabels();
 syncSimConfigInputs();
 renderMemoryView();
 applyTrackAndSensorConfig();
+renderAutoTestReport(sim.autoTest.lastReport);
+syncAutoTestButtons();
 addDebugLine("Debug ready. Use api.log(...) and api.clearLog().");
 requestAnimationFrame(loop);
