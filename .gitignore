@@ -1,1 +1,6 @@
 .wrangler
+
+# Generated simulation outputs
+artifacts/**
+!artifacts/
+!artifacts/README.md
